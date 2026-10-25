@@ -1,8 +1,10 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "fastapi",
   "functions": {
     "rag_deploy/main.py": {
-      "maxDuration": 30
+      "maxDuration": 120,
+      "excludeFiles": "{rag_test/**,rag_app/**,simple_rag_app/**,data/**,overview/**}"
     }
   }
 }

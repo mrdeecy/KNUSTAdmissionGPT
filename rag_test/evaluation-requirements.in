@@ -1,0 +1,10 @@
+# Isolated evaluator; the production app retains its own locked dependencies.
+ragas==0.3.1
+langchain==0.3.27
+langchain-community==0.3.31
+langchain-openai==0.3.35
+pytest==9.1.1
+python-dotenv==1.2.3
+requests==2.34.2
+truststore==0.10.4
+pillow==12.3.0

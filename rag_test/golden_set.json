@@ -9,7 +9,7 @@
   },
   {
     "question": "Is there a discount for Ghanaian applicants, or do international applicants pay extra?",
-    "ground_truth": "The document does not mention a discount for Ghanaian applicants. Instead, all international applicants are expected to pay a non-refundable application processing fee of US$100.00 to the University, which Ghanaian applicants do not pay."
+    "ground_truth": "The document does not specify a discount for Ghanaian applicants or establish a fee comparison. All international applicants are expected to pay a non-refundable application processing fee of US$100.00 to the University."
   },
   {
     "question": "How can a Ghanaian applicant purchase the admission e-voucher?",
@@ -21,7 +21,7 @@
   },
   {
     "question": "How does BSc. Computer Engineering differ from BSc. Computer Science in terms of WASSCE subject requirements?",
-    "ground_truth": "BSc. Computer Engineering requires credit passes in Physics, Elective Mathematics and Chemistry, with Basic/Applied Electricity, Basic Electronics, ICT, Computing, Computer Science, Electrical and Electronic Engineering Technology, Engineering, or Robotic Engineering acceptable in place of Chemistry. BSc. Computer Science requires credit passes in Elective Mathematics, Physics, and either Chemistry, Applied Electricity, or Electronics."
+    "ground_truth": "Both programmes require core credit passes in English Language, Mathematics, and Integrated Science. BSc. Computer Engineering requires credit passes in Physics, Elective Mathematics and Chemistry. For Computer Engineering (programme 11), Electricity/Applied Electricity, Electrical and Electronic Engineering Technology, Engineering and Robotic Engineering, or ICT is acceptable in place of Chemistry. BSc. Computer Science requires credit passes in Elective Mathematics, Physics, and either Chemistry, Applied Electricity, or Electronics."
   },
   {
     "question": "Can a registered general nurse with a diploma apply for a nursing top-up at KNUST?",

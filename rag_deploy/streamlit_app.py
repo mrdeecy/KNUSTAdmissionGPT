@@ -3,16 +3,21 @@
 Talks ONLY to the FastAPI backend (main.py) via HTTP — never imports
 retrieval_pipeline directly. Run the backend first, then:
 
-    streamlit run app.py
+    python -m streamlit run rag_deploy/streamlit_app.py
 """
 import os
+from pathlib import Path
 
 import requests
 import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # Config
 DEFAULT_API_URL = os.getenv("KNUST_API_URL", "http://127.0.0.1:8000")
-REQUEST_TIMEOUT = 30  # seconds — retrieval + generation can take a few seconds
+APP_TOKEN = os.getenv("KNUST_APP_TOKEN")
+REQUEST_TIMEOUT = 130  # The Vercel function allows up to 120 seconds.
 
 st.set_page_config(
     page_title="KNUST Admissions Assistant",
@@ -42,6 +47,7 @@ def ask(api_url: str, question: str, history: list) -> dict:
     resp = requests.post(
         f"{api_url}/query",
         json={"question": question, "history": history},
+        headers={"X-App-Token": APP_TOKEN} if APP_TOKEN else None,
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
@@ -64,17 +70,12 @@ with st.sidebar:
     st.title("🎓 KNUST Admissions")
     st.caption("Ask about programmes, entry requirements, and cut-off aggregates.")
 
-    st.session_state.api_url = st.text_input(
-        "Backend URL", value=st.session_state.api_url,
-        help="Where the FastAPI backend (main.py) is running.",
-    )
-
     healthy = check_health(st.session_state.api_url)
     if healthy:
         st.success("Backend connected")
     else:
         st.error("Backend unreachable")
-        st.caption(f"Checked: {st.session_state.api_url}/health")
+        st.caption("Set KNUST_API_URL to the deployed API URL, then restart the app.")
 
     st.divider()
 
@@ -84,9 +85,8 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Answers are grounded in KNUST's official admissions document. "
-        "If something isn't in the source material, the assistant will say so "
-        "rather than guess."
+        "Pilot for testing. Verify requirements and historical cutoffs with "
+        "KNUST before making an admissions decision; answers can be inaccurate."
     )
 
 
@@ -125,6 +125,7 @@ if not healthy:
     st.caption("⚠️ Connect to the backend (see sidebar) before asking a question.")
 
 if question:
+    prior_history = history_payload()
     # Show the user's message immediately
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
@@ -136,7 +137,7 @@ if question:
             try:
                 # Snapshot history BEFORE appending this turn's messages —
                 # the backend should only see prior turns, not this one.
-                result = ask(st.session_state.api_url, question, history_payload())
+                result = ask(st.session_state.api_url, question, prior_history)
                 answer = result["answer"]
                 sources = result.get("sources", [])
             except requests.Timeout:

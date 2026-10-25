@@ -1,4 +1,6 @@
 import os
+from functools import lru_cache
+from pathlib import Path
 from typing import List, Dict, Optional
 
 from openai import OpenAI
@@ -6,7 +8,7 @@ from pinecone import Pinecone
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -17,39 +19,60 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", 1536))
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
 # Constants
-NAMESPACE = "__default__"
-RERANK_MODEL = "bge-reranker-v2-m3"
-SYSTEM_PROMPT = """You are the KNUST AI Admission assistant. Answer ONLY from the provided 
-        context. If the answer is not in the context, say you don't have that
-        information. Cite the chunk numbers you used, e.g. [1]."""
+NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
+RERANK_MODEL = os.getenv("RERANK_MODEL", "bge-reranker-v2-m3")
+SYSTEM_PROMPT = """You are the KNUST AI Admission assistant. Use ONLY the provided
+context as your factual source. Report the relevant facts it contains, then
+identify any requested details it does not establish. For comparisons, report
+the documented facts for each side even when the difference cannot be determined.
+For example, if a fee is documented but a discount or fee difference is not,
+give the documented fee and say the discount or difference is not specified.
+Never infer an exemption or discount from missing information.
+Only when the context contains NO relevant information should the entire answer
+be "I don't have that information."
+Cite the chunk numbers you used, e.g. [1].
+Distinguish general eligibility requirements from programme-specific cut-off
+aggregates. Give a programme's cutoff only when the context explicitly pairs
+that programme with its numeric cutoff; never substitute the general aggregate
+24 requirement. Include the academic year when the context supplies it, and
+do not present historical cutoffs as current admission guarantees."""
 
-# Initialize clients
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+class ConfigurationError(RuntimeError):
+    """The local configuration or required indexes are missing."""
+
+
+@lru_cache
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        raise ConfigurationError("Set OPENAI_API_KEY in the project .env file.")
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+@lru_cache
+def get_pinecone_client():
+    if not PINECONE_API_KEY:
+        raise ConfigurationError("Set PINECONE_API_KEY in the project .env file.")
+    return Pinecone(api_key=PINECONE_API_KEY)
 
 
 def connect_to_index(client: Pinecone, index_name: str):
     """Connect to the specified index, raising an error if it does not exist."""
     if not client.has_index(index_name):
-        raise ValueError(f"Index '{index_name}' not found.")
+        raise ConfigurationError(f"Index '{index_name}' not found. Run the indexing pipeline.")
     else:
         print(f"Connected to index '{index_name}'.")
     return client.Index(index_name)
 
 
-# Connect to vector databases
-try:
-    pinecone_index_dense = connect_to_index(pinecone_client, INDEX_NAME)
-    pinecone_index_sparse = connect_to_index(pinecone_client, SPARSE_INDEX_NAME)
-except ValueError as e:
-    print(f"Warning: {e} - Search functions will fail until indices are created.")
-    pinecone_index_dense, pinecone_index_sparse = None, None
+@lru_cache
+def get_index(index_name: str):
+    return connect_to_index(get_pinecone_client(), index_name)
 
 
 def embed_query(text: str) -> List[float]:
     """Embed a single query with the same model used to index the corpus."""
-    response = openai_client.embeddings.create(
-        input=text, model=EMBEDDING_MODEL
+    response = get_openai_client().embeddings.create(
+        input=text, model=EMBEDDING_MODEL, dimensions=EMBEDDING_DIM
     )
     return response.data[0].embedding
 
@@ -57,6 +80,7 @@ def embed_query(text: str) -> List[float]:
 def vector_search(query: str, top_k: int = 5, filter_doc_id: str = None) -> List[Dict]:
     """Dense retrieval: embed the query and return the nearest chunks in Pinecone."""
     kwargs = {
+        "namespace":        NAMESPACE,
         "vector":           embed_query(query),
         "top_k":            top_k,
         "include_metadata": True,
@@ -64,7 +88,7 @@ def vector_search(query: str, top_k: int = 5, filter_doc_id: str = None) -> List
     if filter_doc_id:
         kwargs["filter"] = {"doc_id": {"$eq": filter_doc_id}}
 
-    matches = pinecone_index_dense.query(**kwargs).matches
+    matches = get_index(INDEX_NAME).query(**kwargs).matches
     return [
         {
             "chunk_id": m.id,
@@ -78,7 +102,7 @@ def vector_search(query: str, top_k: int = 5, filter_doc_id: str = None) -> List
 
 def bm25_search(query: str, top_k: int = 5) -> List[Dict]:
     """Lexical (BM25-style) retrieval using Pinecone's native sparse index."""
-    resp = pinecone_index_sparse.search(
+    resp = get_index(SPARSE_INDEX_NAME).search(
         namespace=NAMESPACE,
         query={"top_k": top_k, "inputs": {"text": query}},
         fields=["chunk_text", "title"],
@@ -102,10 +126,18 @@ def reciprocal_rank_fusion(
     """Fuse multiple ranked result lists into one, using RRF."""
     scores: Dict[str, float] = {}
     meta:   Dict[str, Dict]  = {}
+    canonical_ids = {}
 
     for results in result_lists:
+        seen = set()
         for rank, r in enumerate(results):        
-            cid = r["chunk_id"]
+            # Older index builds used different IDs for identical chunks.
+            # Merge their evidence while counting each chunk once per list.
+            identity = (r.get("title", ""), " ".join(r["text"].split()))
+            cid = canonical_ids.setdefault(identity, r["chunk_id"])
+            if cid in seen:
+                continue
+            seen.add(cid)
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
             meta.setdefault(cid, r)               
 
@@ -130,7 +162,9 @@ def hybrid_search(query: str, top_k: int = 5, candidates: int = 10) -> List[Dict
 
 def cross_encoder_rerank(query: str, candidates: List[Dict], top_k: int = 3) -> List[Dict]:
     """Rerank candidates with Pinecone's hosted reranking API."""
-    result = pinecone_client.inference.rerank(
+    if not candidates:
+        return []
+    result = get_pinecone_client().inference.rerank(
         model=RERANK_MODEL,
         query=query,
         documents=[{"id": str(i), "text": c["text"]} for i, c in enumerate(candidates)],
@@ -178,7 +212,7 @@ def rewrite_query(query: str, model: str = CHAT_MODEL) -> str:
         "Search query: HND holder entry requirements BSc Computer Engineering\n\n"
         f"User message: {query}\nSearch query:"
     )
-    resp = openai_client.chat.completions.create(
+    resp = get_openai_client().chat.completions.create(
         model=model, temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -220,7 +254,7 @@ def contextualize_query(
         f"Conversation history:\n{history_text}\n\n"
         f"Follow-up question: {question}\nStandalone question:"
     )
-    resp = openai_client.chat.completions.create(
+    resp = get_openai_client().chat.completions.create(
         model=model, temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -235,7 +269,7 @@ def generate_query_variations(query: str, n: int = 3, model: str = CHAT_MODEL) -
         "Return each phrasing on its own line, with no numbering or bullets.\n\n"
         f"Question: {query}"
     )
-    resp = openai_client.chat.completions.create(
+    resp = get_openai_client().chat.completions.create(
         model=model, temperature=0.7,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -355,7 +389,7 @@ def generate_answer(
             messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": query})
 
-    resp = openai_client.chat.completions.create(
+    resp = get_openai_client().chat.completions.create(
         model=model,
         temperature=0,
         messages=messages,
@@ -379,6 +413,8 @@ if __name__ == "__main__":
     print(f"  Embedding model : {EMBEDDING_MODEL} ({EMBEDDING_DIM} dims)")
     print(f"  Chat model      : {CHAT_MODEL}")
     
+    pinecone_index_dense = get_index(INDEX_NAME)
+    pinecone_index_sparse = get_index(SPARSE_INDEX_NAME)
     if pinecone_index_dense and pinecone_index_sparse:
         dense_count  = pinecone_index_dense.describe_index_stats().get("total_vector_count", 0)
         sparse_count = pinecone_index_sparse.describe_index_stats().get("total_vector_count", 0)

@@ -6,11 +6,15 @@ frontend UI is allowed to talk to — the UI never imports `retrieval_pipeline`
 directly.
 """
 import logging
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+import os
+from secrets import compare_digest
+from typing import List, Literal, Optional
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from openai import OpenAIError
 from pinecone.exceptions import PineconeApiException
+from pinecone.errors.exceptions import PineconeConnectionError
 from pydantic import BaseModel, Field
 from . import retrieval_pipeline as rag
 
@@ -29,7 +33,7 @@ app.add_middleware(
 
 
 class ChatMessage(BaseModel):
-    role: str = Field(..., description="'user' or 'assistant'.")
+    role: Literal["user", "assistant"] = Field(..., description="'user' or 'assistant'.")
     content: str
 
 
@@ -62,13 +66,21 @@ class HealthResponse(BaseModel):
     status: str
 
 
+@app.exception_handler(rag.ConfigurationError)
+async def configuration_error_handler(request, exc):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
 @app.post("/query", response_model=QueryResponse)
-def query(request: QueryRequest) -> QueryResponse:
+def query(request: QueryRequest, x_app_token: Optional[str] = Header(default=None)) -> QueryResponse:
+    expected_token = os.getenv("KNUST_APP_TOKEN")
+    if expected_token and not compare_digest(x_app_token or "", expected_token):
+        raise HTTPException(status_code=401, detail="Invalid application token.")
     retriever = rag.AdvancedRetriever(top_k=request.top_k) if request.top_k else rag.retriever
     history = [h.model_dump() for h in request.history] if request.history else None
 
@@ -89,7 +101,13 @@ def query(request: QueryRequest) -> QueryResponse:
 
     try:
         chunks = retriever.retrieve(search_query)
-    except PineconeApiException as exc:
+    except OpenAIError as exc:
+        logger.exception("Query rewriting or embedding failed")
+        raise HTTPException(
+            status_code=502,
+            detail="The language model backend failed to respond.",
+        ) from exc
+    except (PineconeApiException, PineconeConnectionError) as exc:
         logger.exception("Retrieval failed")
         raise HTTPException(
             status_code=503,

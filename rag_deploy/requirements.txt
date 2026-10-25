@@ -1,0 +1,5 @@
+# Streamlit Community Cloud reads this file beside streamlit_app.py.
+# The retrieval dependencies are installed only for the FastAPI backend.
+python-dotenv==1.2.3
+requests==2.34.2
+streamlit==1.62.0

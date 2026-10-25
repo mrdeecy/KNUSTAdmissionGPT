@@ -2,19 +2,15 @@ import os
 import re
 import time
 import warnings
+from pathlib import Path
 from typing import List, Dict
 
 import tiktoken
 from dotenv import load_dotenv
-from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec, CloudProvider, AwsRegion
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-try:
-    from langchain_community.document_loaders import PyMuPDFLoader
-except ImportError:
-    PyMuPDFLoader = None
+from rag_deploy.retrieval_pipeline import get_openai_client, get_pinecone_client
 
 # Keep using the common loader while muting only this known sunset warning
 warnings.filterwarnings(
@@ -23,8 +19,13 @@ warnings.filterwarnings(
     category=DeprecationWarning,
 )
 
+try:
+    from langchain_community.document_loaders import PyMuPDFLoader
+except ImportError:
+    PyMuPDFLoader = None
+
 # Load keys from a .env file 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # Constants and Environment Variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -32,13 +33,9 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("INDEX_NAME", "knust-admission-rag")
 SPARSE_INDEX_NAME = os.getenv("SPARSE_INDEX_NAME", "knust-rag-sparse")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-EMBEDDING_DIM = 1536
-PDF_PATH = "../data/admission_requirement.pdf"
-NAMESPACE = "__default__"
-
-# Initialize clients
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+PDF_PATH = str(Path(__file__).resolve().parents[1] / "data" / "admission_requirement.pdf")
+NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
 
 LIGATURE_FIXES = {
     "Applica on": "Application",
@@ -62,14 +59,10 @@ def clean_pdf_text(text: str) -> str:
         text = text.replace(broken, fixed)
         
     text = re.sub(r"\bof s the application\b", "of the application", text)
-    text = re.sub(r"(?m)^\d{1,3}(?=\d[\.\)]\s?[A-Z])", "", text)
-    text = re.sub(r"(?m)^\d{1,3}(?=\d\s+Faculty\b)", "", text)
-    text = re.sub(
-        r"(?m)^\d{1,3}(?=(Elective|Core|Entry|Faculty|College|Applicants)\b)",
-        "",
-        text,
-    )
-    text = re.sub(r"(?im)^\s*\d{1,4}\s*$", "", text)
+    # Preserve numbered programme headings: later requirements refer to them.
+    # A prefix such as "11)" is not a page number to strip.
+    # Numeric-only lines include cutoff aggregates and grade mappings.
+    # Removing them as presumed page numbers silently destroys admissions data.
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
@@ -148,9 +141,10 @@ def embed_chunks(
         batch_tokens = sum(len(enc.encode(t)) for t in texts)
         total_tokens += batch_tokens
 
-        response = openai_client.embeddings.create(
+        response = get_openai_client().embeddings.create(
             input=texts,
-            model=model
+            model=model,
+            dimensions=EMBEDDING_DIM,
         )
 
         for chunk, emb_data in zip(batch, response.data):
@@ -216,6 +210,24 @@ def create_pinecone_index(
     return index
 
 
+def upsert_to_pinecone_dense(index, chunks: List[Dict], batch_size: int = 100) -> Dict:
+    """Store dense vectors with the same IDs and source text as sparse records."""
+    for start in range(0, len(chunks), batch_size):
+        index.upsert(namespace=NAMESPACE, vectors=[
+            {
+                "id": chunk["chunk_id"],
+                "values": chunk["embedding"],
+                "metadata": {
+                    "text": chunk["text"],
+                    "title": chunk.get("title", ""),
+                    "doc_id": chunk.get("doc_id", ""),
+                },
+            }
+            for chunk in chunks[start:start + batch_size]
+        ])
+    return {"total_upserted": len(chunks)}
+
+
 def upsert_to_pinecone_sparse(
     index,
     chunks: List[Dict],
@@ -249,10 +261,65 @@ def upsert_to_pinecone_sparse(
     return {"total_upserted": total_upserted}
 
 
-def main():
-    """
-    Main execution pipeline. Runs only if the script is executed directly.
-    """
+def extract_cutoff_chunks(pdf_path: str = PDF_PATH) -> List[Dict]:
+    """Keep each table row's programme, cutoff, and academic year together."""
+    import pymupdf
+
+    chunks = []
+    academic_year = None
+    with pymupdf.open(pdf_path) as pdf:
+        for page_number, page in enumerate(pdf, start=1):
+            heading = re.match(
+                r"CUT-OFF AGGREGATES FOR (\d{4}/\d{4})", page.get_text().strip()
+            )
+            if heading:
+                academic_year = heading.group(1)
+            if not academic_year:
+                continue
+            for table_number, table in enumerate(page.find_tables().tables):
+                for row_number, row in enumerate(table.extract()):
+                    if len(row) != 3 or not all(row):
+                        continue
+                    number, programme, cutoff = (" ".join(cell.split()) for cell in row)
+                    if not number.isdigit() or not re.fullmatch(r"\d{1,2}", cutoff):
+                        continue
+                    chunks.append({
+                        "chunk_id": f"KNUST_admission_requirements_pdf_cutoff_{page_number}_{table_number}_{row_number}",
+                        "doc_id": "KNUST_admission_requirements_pdf",
+                        "title": f"KNUST {academic_year} cut-off aggregates (PDF page {page_number})",
+                        "text": f"The cut-off aggregate for {programme} for the {academic_year} "
+                                f"academic year was {cutoff}. These historical cutoffs are a "
+                                "guide for applicants and may vary from year to year.",
+                    })
+    return chunks
+
+
+def create_context_chunks(cleaned_pages: list) -> List[Dict]:
+    """Supplement short snippets with page passages retaining shared requirements."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=3000, chunk_overlap=500,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = []
+    for page in cleaned_pages:
+        # Cutoff tables have dedicated row passages with explicit associations.
+        if re.match(r"CUT-OFF AGGREGATES FOR \d{4}/\d{4}", page.page_content):
+            break
+        if len(page.page_content) <= 500:
+            continue
+        page_number = page.metadata["page"] + 1
+        for part, text in enumerate(splitter.split_text(page.page_content)):
+            chunks.append({
+                "chunk_id": f"KNUST_admission_requirements_pdf_context_{page_number}_{part}",
+                "doc_id": "KNUST_admission_requirements_pdf",
+                "title": f"KNUST Admission Content (PDF page {page_number})",
+                "text": text,
+            })
+    return chunks
+
+
+def prepare_chunks() -> List[Dict]:
+    """Extract and chunk the local PDF without contacting external services."""
     if PyMuPDFLoader is None:
         raise RuntimeError(
             "PyMuPDFLoader not available. Install indexing dependencies: "
@@ -261,6 +328,8 @@ def main():
     
     # 1. Load PDF
     print("Loading PDF...")
+    # Preserve the PDF's reading order: coordinate sorting interleaves the
+    # two columns and can attach another programme's requirements to a heading.
     loader = PyMuPDFLoader(PDF_PATH)
     lc_pdf_pages = loader.load()
     print(f"  Documents loaded: {len(lc_pdf_pages)} (one per page)\n")
@@ -288,35 +357,44 @@ def main():
         
     print(f"  Total chunks: {len(chunked_docs)}\n")
 
-    # 4. Embeddings
-    print("Embedding KenteCode AI corpus...")
     chunks_as_dicts = [
         {"text": doc.page_content, "chunk_id": f"chunk_{i}", **doc.metadata}
         for i, doc in enumerate(chunked_docs)
     ]
+    context_chunks = create_context_chunks(cleaned_pdf_docs)
+    chunks_as_dicts.extend(context_chunks)
+    print(f"  Added {len(context_chunks)} page context passages.")
+    cutoff_chunks = extract_cutoff_chunks()
+    chunks_as_dicts.extend(cutoff_chunks)
+    print(f"  Added {len(cutoff_chunks)} programme-specific cutoff passages.")
+    return chunks_as_dicts
+
+
+def main():
+    chunks_as_dicts = prepare_chunks()
+    print("Embedding KNUST admissions corpus...")
     embedded_chunks = embed_chunks(chunks_as_dicts, model=EMBEDDING_MODEL, batch_size=50)
 
     # 5. Pinecone Dense Index Initialization
+    pinecone_client = get_pinecone_client()
     print("\nInitializing Pinecone Dense Index...")
     pinecone_index = create_pinecone_index(pinecone_client, INDEX_NAME, EMBEDDING_DIM)
 
     # 6. Pinecone Sparse Index Initialization
     print("\nInitializing Pinecone Sparse Index...")
     if pinecone_client.has_index(SPARSE_INDEX_NAME):
-        print(f"Deleting existing index '{SPARSE_INDEX_NAME}'...")
-        pinecone_client.delete_index(SPARSE_INDEX_NAME)
-        time.sleep(5)
-
-    print(f"Creating '{SPARSE_INDEX_NAME}' with integrated embedding model...")
-    pinecone_client.create_index_for_model(
-        name=SPARSE_INDEX_NAME,
-        cloud=CloudProvider.AWS,
-        region=AwsRegion.US_EAST_1,
-        embed={
-            "model": "pinecone-sparse-english-v0",
-            "field_map": {"text": "chunk_text"},
-        },
-    )
+        print(f"Reusing existing index '{SPARSE_INDEX_NAME}'.")
+    else:
+        print(f"Creating '{SPARSE_INDEX_NAME}' with integrated embedding model...")
+        pinecone_client.create_index_for_model(
+            name=SPARSE_INDEX_NAME,
+            cloud=CloudProvider.AWS,
+            region=AwsRegion.US_EAST_1,
+            embed={
+                "model": "pinecone-sparse-english-v0",
+                "field_map": {"text": "chunk_text"},
+            },
+        )
 
     while not pinecone_client.describe_index(SPARSE_INDEX_NAME).status["ready"]:
         print("  Waiting for index to be ready...")
@@ -324,6 +402,9 @@ def main():
     print("  Index created successfully.")
     
     pinecone_index_sparse = pinecone_client.Index(SPARSE_INDEX_NAME)
+
+    print("\nUpserting chunks into dense index...")
+    upsert_to_pinecone_dense(pinecone_index, embedded_chunks)
 
     # 7. Upsert Sparse Data
     print("\nUpserting chunks into sparse index...")

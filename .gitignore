@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.vercel/
+.tools/
+.pytest_cache/
+.local/
